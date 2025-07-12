@@ -82,11 +82,3 @@ clarinet test
 ## Contributing
 
 Contributions are welcome! Please read our contributing guidelines and submit pull requests for any improvements.
-
-## License
-
-MIT License - see LICENSE file for details
-
-## Support
-
-For support and questions, please open an issue in the GitHub repository.
