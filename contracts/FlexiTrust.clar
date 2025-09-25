@@ -1,5 +1,6 @@
 ;; FlexiTrust - Decentralized Freelance Escrow Platform
 ;; A secure escrow system for freelance work payments with multi-milestone support
+;; Now includes reputation tracking system
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -13,6 +14,8 @@
 (define-constant err-invalid-milestone (err u107))
 (define-constant err-milestone-limit (err u108))
 (define-constant err-invalid-description (err u109))
+(define-constant err-invalid-rating (err u110))
+(define-constant err-already-rated (err u111))
 
 ;; Data Variables
 (define-data-var contract-enabled bool true)
@@ -32,7 +35,9 @@
     description: (string-ascii 500),
     is-milestone-project: bool,
     milestone-count: uint,
-    completed-milestones: uint
+    completed-milestones: uint,
+    client-rated: bool,
+    freelancer-rated: bool
   }
 )
 
@@ -52,6 +57,30 @@
     status: (string-ascii 20),
     created-at: uint,
     deadline: uint
+  }
+)
+
+;; Reputation System Maps
+(define-map user-reputation
+  principal
+  {
+    total-projects: uint,
+    completed-projects: uint,
+    cancelled-projects: uint,
+    disputed-projects: uint,
+    disputes-won: uint,
+    total-rating-points: uint,
+    total-ratings: uint,
+    average-rating: uint
+  }
+)
+
+(define-map project-ratings
+  { project-id: uint, rater: principal }
+  {
+    rating: uint,
+    comment: (string-ascii 500),
+    created-at: uint
   }
 )
 
@@ -75,6 +104,26 @@
   )
 )
 
+(define-read-only (get-user-reputation (user principal))
+  (default-to 
+    {
+      total-projects: u0,
+      completed-projects: u0,
+      cancelled-projects: u0,
+      disputed-projects: u0,
+      disputes-won: u0,
+      total-rating-points: u0,
+      total-ratings: u0,
+      average-rating: u0
+    }
+    (map-get? user-reputation user)
+  )
+)
+
+(define-read-only (get-project-rating (project-id uint) (rater principal))
+  (map-get? project-ratings { project-id: project-id, rater: rater })
+)
+
 (define-read-only (get-contract-enabled)
   (var-get contract-enabled)
 )
@@ -92,6 +141,19 @@
     (asserts! (> amount u0) err-invalid-amount)
     (asserts! (< amount u1000000000000) err-invalid-amount)
     (ok (/ (* amount (var-get platform-fee-percentage)) u10000))
+  )
+)
+
+(define-read-only (calculate-success-rate (user principal))
+  (let (
+    (reputation (get-user-reputation user))
+    (total (get total-projects reputation))
+    (completed (get completed-projects reputation))
+  )
+    (if (> total u0)
+      (ok (/ (* completed u100) total))
+      (ok u0)
+    )
   )
 )
 
@@ -157,6 +219,110 @@
   )
 )
 
+(define-private (validate-rating (rating uint))
+  (begin
+    (asserts! (>= rating u1) false)
+    (asserts! (<= rating u5) false)
+    true
+  )
+)
+
+(define-private (update-user-reputation-on-project-creation (client principal) (freelancer principal))
+  (let (
+    (client-rep (get-user-reputation client))
+    (freelancer-rep (get-user-reputation freelancer))
+  )
+    (map-set user-reputation client 
+      (merge client-rep { 
+        total-projects: (+ (get total-projects client-rep) u1)
+      })
+    )
+    (map-set user-reputation freelancer
+      (merge freelancer-rep { 
+        total-projects: (+ (get total-projects freelancer-rep) u1)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-private (update-user-reputation-on-completion (client principal) (freelancer principal))
+  (let (
+    (client-rep (get-user-reputation client))
+    (freelancer-rep (get-user-reputation freelancer))
+  )
+    (map-set user-reputation client 
+      (merge client-rep { 
+        completed-projects: (+ (get completed-projects client-rep) u1)
+      })
+    )
+    (map-set user-reputation freelancer
+      (merge freelancer-rep { 
+        completed-projects: (+ (get completed-projects freelancer-rep) u1)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-private (update-user-reputation-on-cancellation (client principal) (freelancer principal))
+  (let (
+    (client-rep (get-user-reputation client))
+    (freelancer-rep (get-user-reputation freelancer))
+  )
+    (map-set user-reputation client 
+      (merge client-rep { 
+        cancelled-projects: (+ (get cancelled-projects client-rep) u1)
+      })
+    )
+    (map-set user-reputation freelancer
+      (merge freelancer-rep { 
+        cancelled-projects: (+ (get cancelled-projects freelancer-rep) u1)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-private (update-user-reputation-on-dispute (client principal) (freelancer principal))
+  (let (
+    (client-rep (get-user-reputation client))
+    (freelancer-rep (get-user-reputation freelancer))
+  )
+    (map-set user-reputation client 
+      (merge client-rep { 
+        disputed-projects: (+ (get disputed-projects client-rep) u1)
+      })
+    )
+    (map-set user-reputation freelancer
+      (merge freelancer-rep { 
+        disputed-projects: (+ (get disputed-projects freelancer-rep) u1)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-private (update-rating-average (user principal) (new-rating uint))
+  (let (
+    (current-rep (get-user-reputation user))
+    (current-total-points (get total-rating-points current-rep))
+    (current-total-ratings (get total-ratings current-rep))
+    (new-total-points (+ current-total-points new-rating))
+    (new-total-ratings (+ current-total-ratings u1))
+    (new-average (/ new-total-points new-total-ratings))
+  )
+    (map-set user-reputation user 
+      (merge current-rep {
+        total-rating-points: new-total-points,
+        total-ratings: new-total-ratings,
+        average-rating: new-average
+      })
+    )
+    (ok true)
+  )
+)
+
 ;; Public functions
 (define-public (create-project 
   (freelancer principal)
@@ -192,7 +358,9 @@
       description: description,
       is-milestone-project: false,
       milestone-count: u0,
-      completed-milestones: u0
+      completed-milestones: u0,
+      client-rated: false,
+      freelancer-rated: false
     })
     
     ;; Set project funds
@@ -200,6 +368,9 @@
       escrow-balance: amount,
       fee-collected: platform-fee
     })
+    
+    ;; Update reputation stats
+    (unwrap-panic (update-user-reputation-on-project-creation tx-sender freelancer))
     
     ;; Increment project ID
     (var-set next-project-id (+ project-id u1))
@@ -253,7 +424,9 @@
       description: description,
       is-milestone-project: true,
       milestone-count: milestone-count,
-      completed-milestones: u0
+      completed-milestones: u0,
+      client-rated: false,
+      freelancer-rated: false
     })
     
     ;; Set project funds
@@ -270,6 +443,9 @@
       milestone-deadlines 
       u1
     ))
+    
+    ;; Update reputation stats
+    (unwrap-panic (update-user-reputation-on-project-creation tx-sender freelancer))
     
     ;; Increment project ID
     (var-set next-project-id (+ project-id u1))
@@ -424,11 +600,15 @@
     
     ;; Check if all milestones are completed
     (if (is-eq new-completed total-milestones)
-      (map-set projects project-id 
-        (merge project-data { 
-          status: "completed",
-          completed-milestones: new-completed
-        })
+      (begin
+        (map-set projects project-id 
+          (merge project-data { 
+            status: "completed",
+            completed-milestones: new-completed
+          })
+        )
+        ;; Update reputation for completion
+        (unwrap-panic (update-user-reputation-on-completion client freelancer))
       )
       true
     )
@@ -463,6 +643,9 @@
     ;; Clear escrow balance
     (map-set project-funds project-id (merge funds-data { escrow-balance: u0 }))
     
+    ;; Update reputation for completion
+    (unwrap-panic (update-user-reputation-on-completion client freelancer))
+    
     (ok true)
   )
 )
@@ -472,6 +655,7 @@
     (project-data (unwrap! (map-get? projects project-id) err-not-found))
     (funds-data (unwrap! (map-get? project-funds project-id) err-not-found))
     (client (get client project-data))
+    (freelancer (get freelancer project-data))
     (amount (get amount project-data))
     (escrow-balance (get escrow-balance funds-data))
   )
@@ -490,6 +674,9 @@
     ;; Clear escrow balance
     (map-set project-funds project-id (merge funds-data { escrow-balance: u0 }))
     
+    ;; Update reputation for cancellation
+    (unwrap-panic (update-user-reputation-on-cancellation client freelancer))
+    
     (ok true)
   )
 )
@@ -497,6 +684,8 @@
 (define-public (dispute-project (project-id uint))
   (let (
     (project-data (unwrap! (map-get? projects project-id) err-not-found))
+    (client (get client project-data))
+    (freelancer (get freelancer project-data))
   )
     (asserts! (var-get contract-enabled) err-invalid-status)
     (asserts! (validate-project-id project-id) err-not-found)
@@ -505,6 +694,58 @@
     
     ;; Update project status to disputed
     (map-set projects project-id (merge project-data { status: "disputed" }))
+    
+    ;; Update reputation for dispute
+    (unwrap-panic (update-user-reputation-on-dispute client freelancer))
+    
+    (ok true)
+  )
+)
+
+(define-public (rate-user 
+  (project-id uint) 
+  (rating uint) 
+  (comment (string-ascii 500))
+)
+  (let (
+    (project-data (unwrap! (map-get? projects project-id) err-not-found))
+    (client (get client project-data))
+    (freelancer (get freelancer project-data))
+    (is-client (is-eq tx-sender client))
+    (is-freelancer (is-eq tx-sender freelancer))
+    (target-user (if is-client freelancer client))
+    (already-rated (if is-client 
+                      (get client-rated project-data) 
+                      (get freelancer-rated project-data)))
+  )
+    (asserts! (var-get contract-enabled) err-invalid-status)
+    (asserts! (validate-project-id project-id) err-not-found)
+    (asserts! (or is-client is-freelancer) err-unauthorized)
+    (asserts! (is-eq (get status project-data) "completed") err-invalid-status)
+    (asserts! (validate-rating rating) err-invalid-rating)
+    (asserts! (not already-rated) err-already-rated)
+    (asserts! (validate-description comment) err-invalid-description)
+    
+    ;; Create rating record
+    (map-set project-ratings 
+      { project-id: project-id, rater: tx-sender }
+      {
+        rating: rating,
+        comment: comment,
+        created-at: stacks-block-height
+      }
+    )
+    
+    ;; Update project rating flags
+    (if is-client
+      (map-set projects project-id 
+        (merge project-data { client-rated: true }))
+      (map-set projects project-id 
+        (merge project-data { freelancer-rated: true }))
+    )
+    
+    ;; Update target user's rating average
+    (unwrap-panic (update-rating-average target-user rating))
     
     (ok true)
   )
@@ -535,6 +776,7 @@
     (client (get client project-data))
     (freelancer (get freelancer project-data))
     (escrow-balance (get escrow-balance funds-data))
+    (winner (if winner-is-freelancer freelancer client))
   )
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (asserts! (validate-project-id project-id) err-not-found)
@@ -542,16 +784,24 @@
     (asserts! (> escrow-balance u0) err-insufficient-funds)
     
     ;; Transfer funds to winner
-    (if winner-is-freelancer
-      (try! (as-contract (stx-transfer? escrow-balance tx-sender freelancer)))
-      (try! (as-contract (stx-transfer? escrow-balance tx-sender client)))
-    )
+    (try! (as-contract (stx-transfer? escrow-balance tx-sender winner)))
     
     ;; Update project status
     (map-set projects project-id (merge project-data { status: "completed" }))
     
     ;; Clear escrow balance
     (map-set project-funds project-id (merge funds-data { escrow-balance: u0 }))
+    
+    ;; Update winner's disputes-won count
+    (let (
+      (winner-rep (get-user-reputation winner))
+    )
+      (map-set user-reputation winner
+        (merge winner-rep {
+          disputes-won: (+ (get disputes-won winner-rep) u1)
+        })
+      )
+    )
     
     (ok true)
   )
